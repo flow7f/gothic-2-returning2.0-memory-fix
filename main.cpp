@@ -7,7 +7,7 @@
     (brief: you free to distribute or change code and dll, but if you publish
      changed version you also must make your code open under GPL 2.0 license).
 
-  @version: 05
+  @version: 06
 
 ================================================================================
 
@@ -34,8 +34,10 @@
 
 
   Happy gaming and coding :)
-           lviper, Moscow, 2016/01/14
+           lviper, Moscow, 2016/01/16
 */
+
+#pragma comment(lib, "libhoard.lib")
 
 #define MEMCALLTYPE __cdecl
 #define SET_MALLOC_HANDLER			// check OutOfMemory in new_handler (always exit) or in regular function (where will be abort, retry and skip options)
@@ -44,56 +46,139 @@
 #include <Windows.h>
 #include <stdlib.h>
 
-#ifdef SET_MALLOC_HANDLER
 #include <new>
 #include <new.h>
 #include <algorithm>
 
+// sometimes OutOfMemory handler's exit and fatal will ignore interruption or exit. Then just use this flag to correct OutOfMemory again in the next call shi_* function.
+bool isOutOfMemoryAlreadyHappens = false;
 
-size_t emergencyBUfferSizeInMb = 50;
-const size_t minEmergencyBUfferSizeInMb = 5;
-const size_t maxEmergencyBUfferSizeInMb = 300;
-void *emergencyBuffer = nullptr;				// free in case OutOfMemory for correct work system functions
+namespace Settings {
+	bool showGothicErrorMessage = true;	// show Gothic error message
+	bool showMessageBox = false;		// show MessageBox when OutOfMemory happens
+	bool useNewHandler = true;			// check OutOfMemory in new_handler (always exit) or in regular function (where will be abort, retry and skip options)
 
-bool showGothicErrorMessage = true;				// in case out of memory need show gothic error message for callstack
-bool showMessageBox = false;					//                                 messagebox with OutOfMemory message
 
-bool isOutOfMemoryAlreadyHappens = false;		// sometimes OutOfMemory handler's exit and fatal will ignore. Then just make OutOfMemory again in the next call shi_ function.
-#endif
+	const char *iniFile = ".\\SystemPack.ini";
+	const char *iniAppName = "SHW32";
 
-#pragma comment(lib, "libhoard.lib")
+	bool LoadIntFromIni(const char *varName, int &value) {
+		int notExistValue = -12345;
+		int currentValue = GetPrivateProfileIntA(iniAppName, varName, notExistValue, iniFile);
+		if (currentValue == notExistValue)
+			return false;
+
+		value = currentValue;
+		return true;
+	}
+
+	void SaveIntToIni(const char *varName, int value) {
+		char buffer[64];
+		_itoa_s(value, buffer, 10);
+		WritePrivateProfileStringA(iniAppName, varName, buffer, iniFile);
+	}
+
+	template< typename T >
+	void LoadValueFromIniAndSaveIfValueDontExists(const char *varName, T &value) {
+		int intValue = static_cast<int>(value);
+		if (!LoadIntFromIni(varName, intValue))
+			SaveIntToIni(varName, intValue);
+		value = static_cast<T>(intValue);
+	}
+
+	void LoadFromIni() {
+		LoadValueFromIniAndSaveIfValueDontExists("bShowGothicError", showGothicErrorMessage);
+		LoadValueFromIniAndSaveIfValueDontExists("bShowMsgBox", showMessageBox);
+		LoadValueFromIniAndSaveIfValueDontExists("bUseNewHandler", useNewHandler);
+	}
+};
+
+// Emergency buffer for free after OutOfMemory to correct work system functions
+class EmergencyBufferForOutOfMemory {
+public:
+	void FreeMessageBoxBuffer() {
+		free(bufferForMessageBox);
+		bufferForMessageBox = nullptr;
+	}
+	void FreeGothicBuffer() {
+		free(bufferForGothicError);
+		bufferForGothicError = nullptr;
+	}
+												
+												
+	// call after Settings::Load
+	void Initialize() {
+		size_t sizeForGothicError = 50;
+		Settings::LoadValueFromIniAndSaveIfValueDontExists("reserveInMb", sizeForGothicError);
+		sizeForGothicError = std::max(minSize, std::min(maxSize, sizeForGothicError));
+												
+		size_t sizeForMessageBox = 0;
+		if (!Settings::showGothicErrorMessage && !Settings::showMessageBox)
+			sizeForGothicError = 5;
+		else if (Settings::showMessageBox) {
+			if (Settings::showGothicErrorMessage) {
+				if (sizeForGothicError >= 100)
+					sizeForMessageBox = 30;
+				else if (sizeForGothicError >= 60)
+					sizeForMessageBox = 10;
+				else if (sizeForGothicError >= 10)
+					sizeForMessageBox = 5;
+			}
+			else {
+				sizeForMessageBox = sizeForGothicError;
+			}
+			sizeForGothicError -= sizeForMessageBox;
+		}
+												
+		constexpr size_t Mb = 1024 * 1024;
+		if (sizeForGothicError > 0)
+			bufferForGothicError = malloc(sizeForGothicError*Mb);
+		if (sizeForMessageBox > 0)
+			bufferForMessageBox = malloc(sizeForMessageBox*Mb);
+	}
+												
+private:
+	constexpr static size_t minSize = 5;
+	constexpr static size_t maxSize = 300;
+												
+	void *bufferForGothicError = nullptr;
+	void *bufferForMessageBox = nullptr;
+};
+EmergencyBufferForOutOfMemory emergencyBuffer;
+
 
 void TerminateProgram() {
-	if (showGothicErrorMessage) {
-		__asm int 3								// breakpoint for stop at debugger/show fatal gothic messagebox
-	} else {
+	isOutOfMemoryAlreadyHappens = true;
+	emergencyBuffer.FreeGothicBuffer();
+
+	if (Settings::showGothicErrorMessage) {
+		static bool isInterrupted = false;
+		if (!isInterrupted) {
+			isInterrupted = true;
+			__asm int 3h; breakpoint
+		}
+	}
+	else {
 		std::exit(1);
 	}
 }
 
-#ifdef SET_MALLOC_HANDLER
 void OutOfMemoryHandler() {
-	if (emergencyBuffer)
-		free(emergencyBuffer);
-	emergencyBuffer = nullptr;
-	if (!isOutOfMemoryAlreadyHappens && showMessageBox)
+	emergencyBuffer.FreeMessageBoxBuffer();
+	if (!isOutOfMemoryAlreadyHappens && Settings::showMessageBox)
 		MessageBoxA(nullptr, "OutOfMemory!", nullptr, MB_OK | MB_ICONERROR);
 
-	isOutOfMemoryAlreadyHappens = true;
-	TerminateProgram();
-}
-#endif
+	std::set_new_handler(nullptr);
+	_set_new_mode(0);
 
-void ExecuteOutOfMemoryHandlerIfFatalHappens() {
-	if (isOutOfMemoryAlreadyHappens)
-		malloc(std::numeric_limits<size_t>::max());			// call out of memory handler
+	TerminateProgram();
 }
 
 bool IsNeedReallocate(void *data) {
 	bool result = false;
 
-#ifndef SET_MALLOC_HANDLER
-	if (data == nullptr) {
+	if (data == nullptr && !isOutOfMemoryAlreadyHappens) {
+		emergencyBuffer.FreeMessageBoxBuffer();
 		int chose = MessageBoxA(nullptr, "OutOfMemory!", nullptr, MB_ABORTRETRYIGNORE | MB_ICONERROR);
 		if (chose == IDABORT) {
 			TerminateProgram();
@@ -102,14 +187,12 @@ bool IsNeedReallocate(void *data) {
 			result = true;
 		}
 	}
-#endif
 
 	return result;
 }
 
 extern "C" {
 	size_t MEMCALLTYPE shi_msize(void *data) {
-		ExecuteOutOfMemoryHandlerIfFatalHappens();
 		return _msize(data);
 	}
 
@@ -117,9 +200,7 @@ extern "C" {
 		return TRUE;
 	}
 
-	void* MEMCALLTYPE shi_malloc(size_t size) {	
-		ExecuteOutOfMemoryHandlerIfFatalHappens();
-
+	void* MEMCALLTYPE shi_malloc(size_t size) {
 		void *result = nullptr;
 		do {
 			result = malloc(size);
@@ -128,8 +209,6 @@ extern "C" {
 	}
 
 	void* MEMCALLTYPE shi_calloc(size_t num, size_t size) {
-		ExecuteOutOfMemoryHandlerIfFatalHappens();
-
 		void *result = nullptr;
 		do {
 			result = calloc(num, size);
@@ -139,12 +218,9 @@ extern "C" {
 
 	void MEMCALLTYPE shi_delete(void *data) {
 		free(data);
-		ExecuteOutOfMemoryHandlerIfFatalHappens();
 	}
 
 	void* MEMCALLTYPE shi_realloc(void* data, size_t size) {
-		ExecuteOutOfMemoryHandlerIfFatalHappens();
-
 		void *result = nullptr;
 		do {
 			result = realloc(data, size);
@@ -405,44 +481,17 @@ extern "C" {
 #pragma endregion
 }
 
-int loadIntFromIniAndSaveIfValueDontExists(const char *varName, int defaultValue) {
-	const char *iniFile = ".\\SystemPack.ini";
-	int currentValue = GetPrivateProfileIntA("SHW32", varName, -12345, iniFile);
-	if (currentValue == -12345) {
-		// memory don't exists (or incorrect in any case), save defaault value
-		char buffer[16];
-		_itoa_s(defaultValue, buffer, 10);
-		WritePrivateProfileStringA("SHW32", varName, buffer, iniFile);
-
-		return defaultValue;
-	}
-
-	return currentValue;
-}
-
-void loadAndSaveSettingsFromIni() {
-	emergencyBUfferSizeInMb = loadIntFromIniAndSaveIfValueDontExists("reserveInMb", emergencyBUfferSizeInMb);
-
-	showGothicErrorMessage = loadIntFromIniAndSaveIfValueDontExists("bShowGothicError", showGothicErrorMessage);
-	showMessageBox = loadIntFromIniAndSaveIfValueDontExists("bShowMsgBox", showMessageBox);
-
-	if (!showGothicErrorMessage && !showMessageBox)
-		emergencyBUfferSizeInMb = minEmergencyBUfferSizeInMb;
-	else
-		emergencyBUfferSizeInMb = std::min(maxEmergencyBUfferSizeInMb, std::max(emergencyBUfferSizeInMb, minEmergencyBUfferSizeInMb));
-}
 
 BOOL WINAPI DllMain(HINSTANCE module_handle, DWORD reason_for_call, LPVOID reserved)
 {
 	if (reason_for_call == DLL_PROCESS_ATTACH) {
-#ifdef SET_MALLOC_HANDLER
-		loadAndSaveSettingsFromIni();
-		if( emergencyBUfferSizeInMb > 0 )
-			emergencyBuffer = malloc(emergencyBUfferSizeInMb*1024*1024);
+		Settings::LoadFromIni();
+		emergencyBuffer.Initialize();
 
-		std::set_new_handler(&OutOfMemoryHandler);
-		_set_new_mode(1);
-#endif
+		if (Settings::useNewHandler) {
+			std::set_new_handler(&OutOfMemoryHandler);
+			_set_new_mode(1);
+		}
 	}
 	return TRUE;
 }

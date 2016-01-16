@@ -11,7 +11,7 @@ On x64 windows recommended used together with 4gb_patch (http://www.ntcore.com/4
 Fix suitable for use with Gothic I - Gothic II: Night of Raven games with or without any mods.
 
 License: GNU GPL 2.0 - free distribution and change (but if you will publish your changes, then you also will need publish your souce code under GPL 2.0)
-Version: 05 (2016/01/15)
+Version: 06 (2016/01/16)
 Source code: https://bitbucket.org/lviper/gothic_1_2_mem_fix/src
 
 Best regards, lviper.
