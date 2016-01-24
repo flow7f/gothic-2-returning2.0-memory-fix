@@ -37,18 +37,87 @@
            lviper, Moscow, 2016/01/16
 */
 
+//#define MEM_USE_LIBHOARD
+//#define MEM_USE_JEMALLOC
+//#define MEM_USE_CRT
+#define MEM_USE_TCMALLOC
+
+#ifdef MEM_USE_LIBHOARD
 #pragma comment(lib, "libhoard.lib")
+#elif defined(MEM_USE_JEMALLOC)
+#pragma comment(lib, "libjemalloc_x86_Release-Static.lib" )
+#elif defined(MEM_USE_TCMALLOC)
+#pragma comment(lib, "libtcmalloc_minimal.lib")
+#endif
 
 #define MEMCALLTYPE __cdecl
-#define SET_MALLOC_HANDLER			// check OutOfMemory in new_handler (always exit) or in regular function (where will be abort, retry and skip options)
+
 
 #define NOMINMAX
 #include <Windows.h>
 #include <stdlib.h>
 
+#ifdef MEM_USE_JEMALLOC
+#define USE_STATIC
+#define STATIC_ENABLE
+#include <jemalloc/jemalloc.h>
+
+#define shw_malloc je_malloc
+#define shw_free je_free
+#define shw_calloc je_calloc
+#define shw_realloc je_realloc
+#define shw_msize je_malloc_usable_size
+#define shw_init je_init()
+#define shw_uninit je_uninit()
+#elif defined(MEM_USE_TCMALLOC)
+#include <gperftools\tcmalloc.h>
+#define KEEP_ALLOCATED_SIZES
+
+#define shw_malloc tc_malloc
+#define shw_free tc_free
+#define shw_calloc tc_calloc
+#define shw_realloc tc_realloc
+#define shw_msize tc_malloc_size		// >= required size by malloc, so better KEEP_ALLOCATED_SIZES
+#define shw_init
+#define shw_uninit
+#else
+#define shw_malloc malloc
+#define shw_free free
+#define shw_calloc calloc
+#define shw_realloc realloc
+#define shw_msize _msize
+#define shw_init
+#define shw_uninits
+#endif
+
+
+
+
 #include <new>
 #include <new.h>
 #include <algorithm>
+
+#include <unordered_map>
+#include <unordered_set>
+
+extern "C" {
+	size_t MEMCALLTYPE shi_msize(void *data);
+	BOOL MEMCALLTYPE shi_MemInitDefaultPool();
+	void* MEMCALLTYPE shi_malloc(size_t size);
+	void* MEMCALLTYPE shi_calloc(size_t num, size_t size);
+	void MEMCALLTYPE shi_delete(void *data);
+	void* MEMCALLTYPE shi_realloc(void* data, size_t size);
+	void MEMCALLTYPE shi_free(void *data);
+}
+
+#ifdef KEEP_ALLOCATED_SIZES
+std::unordered_map<void*, size_t> allocatedWithSizes;
+#define allocatedContainer allocatedWithSizes
+#else
+std::unordered_set<void*> allocated;
+#define allocatedContainer allocated
+#endif
+
 
 // sometimes OutOfMemory handler's exit and fatal will ignore interruption or exit. Then just use this flag to correct OutOfMemory again in the next call shi_* function.
 bool isOutOfMemoryAlreadyHappens = false;
@@ -57,7 +126,6 @@ namespace Settings {
 	bool showGothicErrorMessage = true;	// show Gothic error message
 	bool showMessageBox = false;		// show MessageBox when OutOfMemory happens
 	bool useNewHandler = true;			// check OutOfMemory in new_handler (always exit) or in regular function (where will be abort, retry and skip options)
-
 
 	const char *iniFile = ".\\SystemPack.ini";
 	const char *iniAppName = "SHW32";
@@ -97,11 +165,11 @@ namespace Settings {
 class EmergencyBufferForOutOfMemory {
 public:
 	void FreeMessageBoxBuffer() {
-		free(bufferForMessageBox);
+		shi_free(bufferForMessageBox);
 		bufferForMessageBox = nullptr;
 	}
 	void FreeGothicBuffer() {
-		free(bufferForGothicError);
+		shi_free(bufferForGothicError);
 		bufferForGothicError = nullptr;
 	}
 												
@@ -132,9 +200,9 @@ public:
 												
 		constexpr size_t Mb = 1024 * 1024;
 		if (sizeForGothicError > 0)
-			bufferForGothicError = malloc(sizeForGothicError*Mb);
+			bufferForGothicError = shi_malloc(sizeForGothicError*Mb);
 		if (sizeForMessageBox > 0)
-			bufferForMessageBox = malloc(sizeForMessageBox*Mb);
+			bufferForMessageBox = shi_malloc(sizeForMessageBox*Mb);
 	}
 												
 private:
@@ -191,8 +259,25 @@ bool IsNeedReallocate(void *data) {
 	return result;
 }
 
+void AddAllocated(void *data, size_t size) {
+	if (!data)
+		return;
+#ifdef KEEP_ALLOCATED_SIZES
+	allocatedWithSizes[data] = size;
+#else
+	allocated.insert(data);
+#endif
+}
+
 extern "C" {
 	size_t MEMCALLTYPE shi_msize(void *data) {
+		auto size = allocatedContainer.find(data);
+		if (size != allocatedContainer.end())
+#ifdef KEEP_ALLOCATED_SIZES
+			return size->second;
+#else
+			return shw_msize(data);
+#endif
 		return _msize(data);
 	}
 
@@ -203,29 +288,57 @@ extern "C" {
 	void* MEMCALLTYPE shi_malloc(size_t size) {
 		void *result = nullptr;
 		do {
-			result = malloc(size);
+			result = shw_malloc(size);
 		} while (IsNeedReallocate(result));
+		AddAllocated(result, size);
 		return result;
 	}
 
 	void* MEMCALLTYPE shi_calloc(size_t num, size_t size) {
 		void *result = nullptr;
 		do {
-			result = calloc(num, size);
+			result = shw_calloc(num, size);
 		} while (IsNeedReallocate(result));
+		AddAllocated(result, size);
 		return result;
 	}
 
 	void MEMCALLTYPE shi_delete(void *data) {
+		auto size = allocatedContainer.find(data);
+		if (size != allocatedContainer.end()) {
+			allocatedContainer.erase(size);
+			shw_free(data);
+			return;
+		}
 		free(data);
 	}
 
 	void* MEMCALLTYPE shi_realloc(void* data, size_t size) {
-		void *result = nullptr;
-		do {
-			result = realloc(data, size);
-		} while (size != 0 && IsNeedReallocate(result));
-		return result;
+		if (size == 0) {
+			shi_delete(data);
+			return nullptr;
+		}
+
+		auto oldSizeIter = allocatedContainer.find(data);
+		if (oldSizeIter != allocatedContainer.end()) {
+			void *result = nullptr;
+			do {
+				result = shw_realloc(data, size);
+			} while (IsNeedReallocate(result));
+			if (result != nullptr) {
+				allocatedContainer.erase(oldSizeIter);
+				AddAllocated(result, size);
+			}
+			return result;
+		}
+		else {
+			void *result = nullptr;
+			do {
+				result = realloc(data, size);
+			} while (IsNeedReallocate(result));
+			return result;
+		}
+
 	}
 
 	void MEMCALLTYPE shi_free(void *data) {
@@ -485,6 +598,8 @@ extern "C" {
 BOOL WINAPI DllMain(HINSTANCE module_handle, DWORD reason_for_call, LPVOID reserved)
 {
 	if (reason_for_call == DLL_PROCESS_ATTACH) {
+		shw_init;
+
 		Settings::LoadFromIni();
 		emergencyBuffer.Initialize();
 
@@ -492,6 +607,9 @@ BOOL WINAPI DllMain(HINSTANCE module_handle, DWORD reason_for_call, LPVOID reser
 			std::set_new_handler(&OutOfMemoryHandler);
 			_set_new_mode(1);
 		}
+	}
+	else if (reason_for_call == DLL_PROCESS_DETACH) {
+		shw_uninit;
 	}
 	return TRUE;
 }
