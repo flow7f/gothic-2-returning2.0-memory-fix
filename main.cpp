@@ -3,11 +3,11 @@
 
   @author: lviper
   
-  @license: GNU GPL 2.0
-    (brief: you free to distribute or change code and dll, but if you publish
-     changed version you also must make your code open under GPL 2.0 license).
+  @license: GNU GPL 2.0 / BSD-derived
+    See Readme_G_mem_fix_en.txt for details.
+    (brief: you free to distribute or change code and dll).
 
-  @version: 06
+  @version: 07
 
 ================================================================================
 
@@ -25,7 +25,8 @@
 
   Just compile and replace original Shw32.dll in Game/System directory.
 
-  I compiled this program with Hoard 3.10 library, but you can experiment with 
+  I compiled this program with Hoard 3.10, JeMalloc 4.0.4, TCMalloc 2.4 and
+    allocators from standard VS 2015 C++ library, but you can experiment with 
     your favorite allocation memroy library for best results for yourself.
   If any other game or program use old version of SmartHeap library (shw32.dll) 
     you can try to use this fix, but in this case you must implement all 
@@ -34,21 +35,27 @@
 
 
   Happy gaming and coding :)
-           lviper, Moscow, 2016/01/16
+           lviper, Moscow, 2016/01/24
 */
 
-//#define MEM_USE_LIBHOARD
-//#define MEM_USE_JEMALLOC
-//#define MEM_USE_CRT
-#define MEM_USE_TCMALLOC
 
-#ifdef MEM_USE_LIBHOARD
-#pragma comment(lib, "libhoard.lib")
-#elif defined(MEM_USE_JEMALLOC)
-#pragma comment(lib, "libjemalloc_x86_Release-Static.lib" )
-#elif defined(MEM_USE_TCMALLOC)
-#pragma comment(lib, "libtcmalloc_minimal.lib")
+//#define MEM_USE_LIBHOARD		// Compile with libhoard (need also add UseLibHoard.cpp)
+//#define MEM_USE_JEMALLOC		// Compile with JeMalloc
+//#define MEM_USE_TCMALLOC		// Compile with TCMalloc
+//#define MEM_USE_CRT			// Compile with standard library (by default if not defined others)
+
+// add $(PlatformToolset) to definitions in project settings
+#ifdef v140_xp
+#define USE_XP_COMPATIBILITY
 #endif
+
+#if !defined(MEM_USE_LIBHOARD) && !defined(MEM_USE_JEMALLOC) && !defined(MEM_USE_TCMALLOC) && !defined(MEM_USE_CRT)
+#define MEM_USE_CRT
+#endif
+
+//#define KEEP_ALLOCATED_NOTHING	// Don't save any information about blocks, returned by shw_*alloc
+//#define KEEP_ALLOCATED_POINTERS	// Save only pointers to allocated blocks
+//#define KEEP_ALLOCATED_SIZES		// Save pointers and size of allocated blocks
 
 #define MEMCALLTYPE __cdecl
 
@@ -56,12 +63,18 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <stdlib.h>
+#include <string>
+using namespace std::string_literals;
 
 #ifdef MEM_USE_JEMALLOC
+#define KEEP_ALLOCATED_POINTERS
 #define USE_STATIC
-#define STATIC_ENABLE
 #include <jemalloc/jemalloc.h>
-
+#ifdef USE_XP_COMPATIBILITY
+#pragma comment(lib, "libjemalloc_x86_Release-Static-xp.lib" )
+#else
+#pragma comment(lib, "libjemalloc_x86_Release-Static.lib" )
+#endif
 #define shw_malloc je_malloc
 #define shw_free je_free
 #define shw_calloc je_calloc
@@ -69,9 +82,16 @@
 #define shw_msize je_malloc_usable_size
 #define shw_init je_init()
 #define shw_uninit je_uninit()
+
 #elif defined(MEM_USE_TCMALLOC)
-#include <gperftools\tcmalloc.h>
 #define KEEP_ALLOCATED_SIZES
+
+#include <gperftools\tcmalloc.h>
+#ifdef USE_XP_COMPATIBILITY
+#pragma comment(lib, "libtcmalloc_minimal-xp.lib")
+#else
+#pragma comment(lib, "libtcmalloc_minimal.lib")
+#endif
 
 #define shw_malloc tc_malloc
 #define shw_free tc_free
@@ -80,22 +100,33 @@
 #define shw_msize tc_malloc_size		// >= required size by malloc, so better KEEP_ALLOCATED_SIZES
 #define shw_init
 #define shw_uninit
+
 #else
+#ifdef MEM_USE_LIBHOARD
+#include <uselibhoard.cpp>
+
+#ifdef USE_XP_COMPATIBILITY
+#pragma comment(lib, "libhoard-xp.lib")
+#else
+#pragma comment(lib, "libhoard.lib")
+#endif
+#endif
+#define KEEP_ALLOCATED_NOTHING
+
 #define shw_malloc malloc
 #define shw_free free
 #define shw_calloc calloc
 #define shw_realloc realloc
 #define shw_msize _msize
 #define shw_init
-#define shw_uninits
+#define shw_uninit
 #endif
-
-
 
 
 #include <new>
 #include <new.h>
 #include <algorithm>
+#include <memory>
 
 #include <unordered_map>
 #include <unordered_set>
@@ -110,66 +141,262 @@ extern "C" {
 	void MEMCALLTYPE shi_free(void *data);
 }
 
-#ifdef KEEP_ALLOCATED_SIZES
-std::unordered_map<void*, size_t> allocatedWithSizes;
-#define allocatedContainer allocatedWithSizes
+// Because memory must be deallocated with the same allocation library we need to keep all pointers that we allocated.
+// For some libraries (like Hoard or CRT) this isn't necessary at all, but I think this is still good to know what memory 
+//   we allocated.
+// For some libraries (TCMalloc for example) we also need to keep allocated sizes, because there isn't way to get exacly 
+//   size, that was required in malloc.
+class AllocatedKeeper {
+#pragma region Allocator
+	template <class T> class Allocator;
+	template <> class Allocator<void>
+	{
+	public:
+		typedef void * pointer;
+		typedef const void* const_pointer;
+		typedef void value_type;
+		template <class U> struct rebind { typedef Allocator<U> other; };
+	};
+
+	template< typename T >
+	class Allocator {
+	public:
+		typedef T value_type;
+		typedef size_t size_type;
+		typedef ptrdiff_t difference_type;
+		typedef T* pointer;
+		typedef const T* const_pointer;
+		typedef T& reference;
+		typedef const T& const_reference;
+
+		template< typename U > struct rebind { typedef Allocator<U> other; };
+		Allocator(void) {}
+		Allocator(const Allocator& other) {}
+		template <class U> Allocator(const Allocator<U>&) {}
+		pointer address(reference r) const { return &r; }
+		const_pointer address(const_reference r) const { return &r; }
+		pointer allocate(size_type n, Allocator<void>::const_pointer hint = 0) {
+			return reinterpret_cast<pointer>(shw_malloc(n));
+		}
+		void deallocate(pointer p, size_type n) {
+			shw_free(p);
+		}
+		size_type max_size() const {
+			return 0xFFFFFFFF / sizeof(T);
+		}
+		void construct(pointer ptr) {
+			::new (reinterpret_cast<void*>(ptr)) T;
+		}
+		template <class U> void construct(pointer ptr, const U& val)	{
+			::new (reinterpret_cast<void*>(ptr)) T(val);
+		}
+		void construct(pointer ptr, const T& val) {
+			::new (reinterpret_cast<void*>(ptr)) T(val);
+		}
+		void destroy(pointer p) {
+			p->T::~T();
+		}
+	};
+#pragma endregion
+
+public:
+	// Check that block was allocated by shi_*alloc
+	bool IsAllocated(void *block) {
+#ifdef KEEP_ALLOCATED_NOTHING
+		return true;
 #else
-std::unordered_set<void*> allocated;
-#define allocatedContainer allocated
+		return allocated.count(block) > 0;
+#endif
+	}
+
+	// Add new block to allocated
+	void AddAllocated(void *block, size_t size) {
+#ifdef KEEP_ALLOCATED_NOTHING
+		return;
+#else
+		if (!block)
+			return;
+#ifdef KEEP_ALLOCATED_SIZES
+		allocated[block] = size;
+#else
+		allocated.insert(block);
+#endif
+#endif
+	}
+
+	// Remove block from allocated
+	bool Free(void *block) {
+#ifndef KEEP_ALLOCATED_NOTHING
+		if (!block)
+			return false;
+
+		return allocated.erase(block) > 0;
+#endif
+		return false;
+	}
+
+	// Get size of allocated block
+	size_t GetSize(void *block) {
+#ifndef KEEP_ALLOCATED_NOTHING
+		auto size = allocated.find(block);
+		if (size != allocated.end()) {
+#ifdef KEEP_ALLOCATED_SIZES
+			return size->second;
+#else
+			return shw_msize(block);
+#endif
+		}
+		return _msize(block);
+#else
+		return shw_msize(block);
+#endif
+	}
+
+private:
+#ifndef KEEP_ALLOCATED_NOTHING
+#ifdef KEEP_ALLOCATED_SIZES
+	typedef std::unordered_map<void*, size_t, std::hash<void*>, std::equal_to<void*>, Allocator<std::pair<void*, size_t>>> AllocatedContainer;
+#else
+	typedef std::unordered_set<void*, std::hash<void*>, std::equal_to<void*>, Allocator<void*>> AllocatedContainer;
 #endif
 
+	AllocatedContainer allocated;
+#endif
+};
+AllocatedKeeper allocatedKeeper;
+
+class Settings {
+public:
+	// Update path with SystemPack.ini with settings
+	void UpdateIniPath() {
+		char fullPath[MAX_PATH+1];
+		auto readedPath = ::GetModuleFileNameA(nullptr, fullPath, MAX_PATH + 1);
+		if ( readedPath >= MAX_PATH ) {
+			fullPath[MAX_PATH] = '\0';		// On XP if path too long, then it won't be '\0' truncated
+		}
+		else if (readedPath == 0) {
+			SetDefaultIniPath();
+			return;
+		}
+
+		iniPath = fullPath;
+		
+		auto lastDir = iniPath.find_last_of("/\\");
+		if (lastDir == iniPath.npos) {
+			SetDefaultIniPath();
+			return;
+		}
+
+		iniPath = iniPath.substr(0, lastDir + 1) + iniFile;
+	}
+
+	// Load integer type (keep original value if don't found)
+	template< typename T >
+	bool LoadInt(const char *name, T &value, int notExistMarker = -123456 ) {
+		int currentValue = ::GetPrivateProfileIntA(iniAppName, name, notExistMarker, iniPath.c_str());
+		if (currentValue == notExistMarker) {
+			needSave = true;
+			return false;
+		}
+
+		value = static_cast<T>(currentValue);
+		return true;
+	}
+
+	void SaveInt(const char *name, int value) {
+		WritePrivateProfileStringA(iniAppName, name, std::to_string(value).c_str(), iniPath.c_str());
+	}
+
+	bool IsNeedSave() const {
+		return needSave;
+	}
+
+	void Save(bool forceCreateFile) {
+		if (!needSave)
+			return;
+
+		UpdateIniPath();
+
+		if (!forceCreateFile) {
+			WIN32_FIND_DATAA data;
+			HANDLE hFile = FindFirstFileA(iniPath.c_str(), &data);
+			if (hFile == INVALID_HANDLE_VALUE) {
+				return;
+			}
+			FindClose(hFile);
+		}
+
+		SaveInt("bShowGothicError", showGothicErrorMessage);
+		SaveInt("bShowMsgBox", showMessageBox);
+		SaveInt("reserveInMb", reserveInMB);
+		SaveInt("bUseNewHandler", useNewHandler);
+		needSave = false;
+	}
+
+
+	void Load() {
+		needSave = false;
+		UpdateIniPath();
+		LoadInt("bShowGothicError", showGothicErrorMessage);
+		LoadInt("bShowMsgBox", showMessageBox);
+		LoadInt("reserveInMb", reserveInMB);
+		LoadInt("bUseNewHandler", useNewHandler);
+	}
+
+
+	bool IsUseNewHandler() const {
+		return useNewHandler;
+	}
+
+	bool IsShowMessageBox() const {
+		return showMessageBox;
+	}
+
+	bool IsShowGothicError() const {
+		return showGothicErrorMessage;
+	}
+
+	size_t GetReserveInMB() const {
+		return reserveInMB;
+	}
+
+private:
+	void SetDefaultIniPath() {
+		iniPath = ".\\"s + iniFile;
+	}
+
+	const char *iniAppName = "SHW32";
+	const char *iniFile = "SystemPack.ini";
+
+	std::string iniPath = ".\\SystemPack.ini"s;
+
+	bool useNewHandler = true;
+	bool showMessageBox = true;
+	bool showGothicErrorMessage = true;
+	size_t reserveInMB = 50;
+	
+	bool needSave = false;
+};
+Settings settings;
 
 // sometimes OutOfMemory handler's exit and fatal will ignore interruption or exit. Then just use this flag to correct OutOfMemory again in the next call shi_* function.
 bool isOutOfMemoryAlreadyHappens = false;
 
-namespace Settings {
-	bool showGothicErrorMessage = true;	// show Gothic error message
-	bool showMessageBox = false;		// show MessageBox when OutOfMemory happens
-	bool useNewHandler = true;			// check OutOfMemory in new_handler (always exit) or in regular function (where will be abort, retry and skip options)
-
-	const char *iniFile = ".\\SystemPack.ini";
-	const char *iniAppName = "SHW32";
-
-	bool LoadIntFromIni(const char *varName, int &value) {
-		int notExistValue = -12345;
-		int currentValue = GetPrivateProfileIntA(iniAppName, varName, notExistValue, iniFile);
-		if (currentValue == notExistValue)
-			return false;
-
-		value = currentValue;
-		return true;
-	}
-
-	void SaveIntToIni(const char *varName, int value) {
-		char buffer[64];
-		_itoa_s(value, buffer, 10);
-		WritePrivateProfileStringA(iniAppName, varName, buffer, iniFile);
-	}
-
-	template< typename T >
-	void LoadValueFromIniAndSaveIfValueDontExists(const char *varName, T &value) {
-		int intValue = static_cast<int>(value);
-		if (!LoadIntFromIni(varName, intValue))
-			SaveIntToIni(varName, intValue);
-		value = static_cast<T>(intValue);
-	}
-
-	void LoadFromIni() {
-		LoadValueFromIniAndSaveIfValueDontExists("bShowGothicError", showGothicErrorMessage);
-		LoadValueFromIniAndSaveIfValueDontExists("bShowMsgBox", showMessageBox);
-		LoadValueFromIniAndSaveIfValueDontExists("bUseNewHandler", useNewHandler);
-	}
-};
 
 // Emergency buffer for free after OutOfMemory to correct work system functions
 class EmergencyBufferForOutOfMemory {
 public:
+	~EmergencyBufferForOutOfMemory() {
+		FreeMessageBoxBuffer();
+		FreeGothicBuffer();
+	}
+
 	void FreeMessageBoxBuffer() {
-		shi_free(bufferForMessageBox);
+		shw_free(bufferForMessageBox);
 		bufferForMessageBox = nullptr;
 	}
 	void FreeGothicBuffer() {
-		shi_free(bufferForGothicError);
+		shw_free(bufferForGothicError);
 		bufferForGothicError = nullptr;
 	}
 												
@@ -177,14 +404,14 @@ public:
 	// call after Settings::Load
 	void Initialize() {
 		size_t sizeForGothicError = 50;
-		Settings::LoadValueFromIniAndSaveIfValueDontExists("reserveInMb", sizeForGothicError);
+		sizeForGothicError = settings.GetReserveInMB();
 		sizeForGothicError = std::max(minSize, std::min(maxSize, sizeForGothicError));
 												
 		size_t sizeForMessageBox = 0;
-		if (!Settings::showGothicErrorMessage && !Settings::showMessageBox)
+		if (!settings.IsShowGothicError() && !settings.IsShowMessageBox())
 			sizeForGothicError = 5;
-		else if (Settings::showMessageBox) {
-			if (Settings::showGothicErrorMessage) {
+		else if (settings.IsShowMessageBox()) {
+			if (settings.IsShowGothicError()) {
 				if (sizeForGothicError >= 100)
 					sizeForMessageBox = 30;
 				else if (sizeForGothicError >= 60)
@@ -200,9 +427,9 @@ public:
 												
 		constexpr size_t Mb = 1024 * 1024;
 		if (sizeForGothicError > 0)
-			bufferForGothicError = shi_malloc(sizeForGothicError*Mb);
+			bufferForGothicError = shw_malloc(sizeForGothicError*Mb);
 		if (sizeForMessageBox > 0)
-			bufferForMessageBox = shi_malloc(sizeForMessageBox*Mb);
+			bufferForMessageBox = shw_malloc(sizeForMessageBox*Mb);
 	}
 												
 private:
@@ -219,7 +446,7 @@ void TerminateProgram() {
 	isOutOfMemoryAlreadyHappens = true;
 	emergencyBuffer.FreeGothicBuffer();
 
-	if (Settings::showGothicErrorMessage) {
+	if (settings.IsShowGothicError()) {
 		static bool isInterrupted = false;
 		if (!isInterrupted) {
 			isInterrupted = true;
@@ -233,8 +460,8 @@ void TerminateProgram() {
 
 void OutOfMemoryHandler() {
 	emergencyBuffer.FreeMessageBoxBuffer();
-	if (!isOutOfMemoryAlreadyHappens && Settings::showMessageBox)
-		MessageBoxA(nullptr, "OutOfMemory!", nullptr, MB_OK | MB_ICONERROR);
+	if (!isOutOfMemoryAlreadyHappens && settings.IsShowMessageBox())
+		MessageBoxW(nullptr, L"OutOfMemory!", nullptr, MB_OK | MB_ICONERROR);
 
 	std::set_new_handler(nullptr);
 	_set_new_mode(0);
@@ -247,7 +474,7 @@ bool IsNeedReallocate(void *data) {
 
 	if (data == nullptr && !isOutOfMemoryAlreadyHappens) {
 		emergencyBuffer.FreeMessageBoxBuffer();
-		int chose = MessageBoxA(nullptr, "OutOfMemory!", nullptr, MB_ABORTRETRYIGNORE | MB_ICONERROR);
+		int chose = MessageBoxW(nullptr, L"OutOfMemory!", nullptr, MB_ABORTRETRYIGNORE | MB_ICONERROR);
 		if (chose == IDABORT) {
 			TerminateProgram();
 		}
@@ -259,26 +486,9 @@ bool IsNeedReallocate(void *data) {
 	return result;
 }
 
-void AddAllocated(void *data, size_t size) {
-	if (!data)
-		return;
-#ifdef KEEP_ALLOCATED_SIZES
-	allocatedWithSizes[data] = size;
-#else
-	allocated.insert(data);
-#endif
-}
-
 extern "C" {
 	size_t MEMCALLTYPE shi_msize(void *data) {
-		auto size = allocatedContainer.find(data);
-		if (size != allocatedContainer.end())
-#ifdef KEEP_ALLOCATED_SIZES
-			return size->second;
-#else
-			return shw_msize(data);
-#endif
-		return _msize(data);
+		return allocatedKeeper.GetSize(data);
 	}
 
 	BOOL MEMCALLTYPE shi_MemInitDefaultPool() {
@@ -290,7 +500,8 @@ extern "C" {
 		do {
 			result = shw_malloc(size);
 		} while (IsNeedReallocate(result));
-		AddAllocated(result, size);
+
+		allocatedKeeper.AddAllocated(result, size);
 		return result;
 	}
 
@@ -299,18 +510,15 @@ extern "C" {
 		do {
 			result = shw_calloc(num, size);
 		} while (IsNeedReallocate(result));
-		AddAllocated(result, size);
+		allocatedKeeper.AddAllocated(result, size);
 		return result;
 	}
 
 	void MEMCALLTYPE shi_delete(void *data) {
-		auto size = allocatedContainer.find(data);
-		if (size != allocatedContainer.end()) {
-			allocatedContainer.erase(size);
+		if (allocatedKeeper.Free(data))
 			shw_free(data);
-			return;
-		}
-		free(data);
+		else
+			free(data);
 	}
 
 	void* MEMCALLTYPE shi_realloc(void* data, size_t size) {
@@ -319,15 +527,14 @@ extern "C" {
 			return nullptr;
 		}
 
-		auto oldSizeIter = allocatedContainer.find(data);
-		if (oldSizeIter != allocatedContainer.end()) {
+		if (allocatedKeeper.IsAllocated(data)) {
 			void *result = nullptr;
 			do {
 				result = shw_realloc(data, size);
 			} while (IsNeedReallocate(result));
 			if (result != nullptr) {
-				allocatedContainer.erase(oldSizeIter);
-				AddAllocated(result, size);
+				allocatedKeeper.Free(data);
+				allocatedKeeper.AddAllocated(result, size);
 			}
 			return result;
 		}
@@ -599,17 +806,23 @@ BOOL WINAPI DllMain(HINSTANCE module_handle, DWORD reason_for_call, LPVOID reser
 {
 	if (reason_for_call == DLL_PROCESS_ATTACH) {
 		shw_init;
-
-		Settings::LoadFromIni();
+		settings.Load();
+		settings.Save(false);
 		emergencyBuffer.Initialize();
 
-		if (Settings::useNewHandler) {
+		if (settings.IsUseNewHandler()) {
 			std::set_new_handler(&OutOfMemoryHandler);
 			_set_new_mode(1);
 		}
-	}
-	else if (reason_for_call == DLL_PROCESS_DETACH) {
+	} else if (reason_for_call == DLL_PROCESS_DETACH) {
+		emergencyBuffer.FreeMessageBoxBuffer();
+		emergencyBuffer.FreeGothicBuffer();
+		if (settings.IsNeedSave()) {
+			settings.Load();		// try to load settings if any added by other modules
+			settings.Save(true);	// save all settings to the file
+		}
 		shw_uninit;
 	}
+
 	return TRUE;
 }
